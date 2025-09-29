@@ -61,25 +61,45 @@
 </template>
 
 <script setup>
+/**
+ * Full, copy-pastable Vue 3 single-file component (script setup).
+ *
+ * Notes:
+ * - Adjust API_BASE and WS_URL to match your backend host/ports.
+ * - currentUser: replace with your auth-derived user id/username (e.g., from JWT or Vuex).
+ * - This file expects:
+ *    GET  {API_BASE}/messages/conversations                -> list conversations
+ *    GET  {API_BASE}/messages/conversations/{conversationId} -> messages list
+ *    POST {API_BASE}/messages/conversations                -> create conversation (not used here)
+ *
+ * - WebSocket / STOMP:
+ *    Register:   /app/chat.register  (payload: { senderId })
+ *    Send:       /app/chat.send      (payload: { conversationId, senderId, content })
+ *    Server broadcast topic: /topic/conversation.{conversationId}
+ *    Optional server-to-user status: /user/queue/message.status
+ */
+
 import { ref, reactive, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
 import axios from "axios";
 import * as StompJs from "@stomp/stompjs";
-import SockJS from "sockjs-client/dist/sockjs.js";
+import SockJS from "sockjs-client";
 
 /* --------- Config (change to your backend URLs) ---------- */
-const API_BASE = "http://localhost:8485/api"; // e.g. http://localhost:8080/api
-const WS_ENDPOINT = "/ws"; // e.g. ws endpoint registered in Spring Boot (SockJS)
-const currentUser = "me"; // replace with your auth username or id from auth token
+const API_BASE = "http://localhost:8485/api"; // <-- change to your API base
+const WS_URL = "http://localhost:8485/ws"; // <-- full SockJS endpoint (must match Spring mapping)
+const currentUser = localStorage.getItem("username") || "me"; // replace with auth-derived id/username
 /* -------------------------------------------------------- */
 
 /* state */
-const chats = ref([]);
-const selectedChat = ref(null);
-const messages = ref([]);
+const chats = ref([]); // { id, name, lastMessage }
+const selectedChat = ref(null); // { id, name, ... }
+const messages = ref([]); // { id, from, text, sentAt }
 const newMessage = ref("");
 const wsConnected = ref(false);
+
 const stompClient = ref(null);
-const subscriptions = reactive({}); // map chatId -> subscription
+const subscriptions = reactive({}); // map conversationId -> subscription (Stomp subscription)
+const userQueueSub = ref(null);
 
 const messagesContainer = ref(null);
 
@@ -100,8 +120,15 @@ const formatTime = (iso) => {
 /* ----- REST calls ----- */
 const loadChats = async () => {
   try {
+    // GET /api/messages/conversations
     const res = await axios.get(`${API_BASE}/messages/conversations`);
-    chats.value = res.data;
+    // normalize to {id, name, lastMessage}
+    chats.value = (res.data || []).map((c) => ({
+      id: c.id,
+      name: c.name || c.title || `Conversation ${c.id}`,
+      lastMessage: c.lastMessage || (c.last_message ? c.last_message : ""),
+      raw: c,
+    }));
     if (!selectedChat.value && chats.value.length) {
       selectChat(chats.value[0]);
     }
@@ -110,14 +137,28 @@ const loadChats = async () => {
   }
 };
 
-const loadMessages = async (chatId) => {
+const loadMessages = async (conversationId) => {
   try {
-    const res = await axios.get(`${API_BASE}/messages/conversations/${chatId}`);
-    messages.value = res.data || [];
+    // GET /api/messages/conversations/{conversationId}
+    const res = await axios.get(`${API_BASE}/messages/conversations/${conversationId}`);
+    // normalize incoming message objects to UI shape: { id, from, text, sentAt }
+    messages.value = (res.data || []).map((m) => normalizeIncomingMessage(m));
     await scrollToBottom();
   } catch (err) {
     console.error("Failed to load messages", err);
+    messages.value = [];
   }
+};
+
+/* normalize different backend message shapes to UI */
+const normalizeIncomingMessage = (m) => {
+  return {
+    id: m.messageId ?? m.id ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    from: m.senderId ?? m.from ?? m.user ?? "unknown",
+    text: m.content ?? m.text ?? m.body ?? "",
+    sentAt: m.sentAt ?? m.createdAt ?? m.timestamp ?? new Date().toISOString(),
+    raw: m,
+  };
 };
 
 /* ----- WebSocket / STOMP ----- */
@@ -125,17 +166,44 @@ const connectWebsocket = () => {
   if (stompClient.value && stompClient.value.connected) return;
 
   // Create STOMP client over SockJS
-  const socket = new SockJS(WS_ENDPOINT);
   const client = new StompJs.Client({
-    webSocketFactory: () => socket,
+    // give STOMP a factory that returns a SockJS instance
+    webSocketFactory: () => new SockJS(WS_URL),
     reconnectDelay: 5000,
     heartbeatIncoming: 10000,
     heartbeatOutgoing: 10000,
-    onConnect: () => {
-      console.log("STOMP connected");
+    onConnect: (frame) => {
+      console.log("STOMP connected", frame);
       wsConnected.value = true;
 
-      // re-subscribe to current chat if exists
+      // Register user on server so server can target messages to /user/{username}
+      try {
+        client.publish({
+          destination: "/app/chat.register",
+          body: JSON.stringify({ senderId: currentUser }),
+        });
+      } catch (err) {
+        console.warn("Failed to publish register", err);
+      }
+
+      // subscribe to server-to-user queue for message status updates (optional)
+      try {
+        // server sends to user using convertAndSendToUser(..., "/queue/message.status", ...)
+        userQueueSub.value = client.subscribe("/user/queue/message.status", (frame) => {
+          if (!frame.body) return;
+          try {
+            const statusMsg = JSON.parse(frame.body);
+            // you can handle delivery status here (e.g., mark message by messageId as SENT/DELIVERED)
+            console.log("message.status", statusMsg);
+          } catch (e) {
+            console.log("message.status (non-json)", frame.body);
+          }
+        });
+      } catch (err) {
+        console.warn("Failed to subscribe to user queue", err);
+      }
+
+      // if a chat is selected, subscribe
       if (selectedChat.value) {
         subscribeToChat(selectedChat.value.id);
       }
@@ -146,6 +214,9 @@ const connectWebsocket = () => {
     onDisconnect: () => {
       wsConnected.value = false;
     },
+    onWebSocketClose: () => {
+      wsConnected.value = false;
+    },
   });
 
   client.activate();
@@ -154,45 +225,88 @@ const connectWebsocket = () => {
 
 const disconnectWebsocket = () => {
   if (stompClient.value) {
+    try {
+      // unsubscribe user queue
+      if (userQueueSub.value) {
+        userQueueSub.value.unsubscribe();
+        userQueueSub.value = null;
+      }
+      Object.keys(subscriptions).forEach((id) => {
+        if (subscriptions[id]) {
+          subscriptions[id].unsubscribe();
+        }
+      });
+    } catch (err) {
+      // ignore
+    }
+
     stompClient.value.deactivate();
     stompClient.value = null;
     wsConnected.value = false;
   }
 };
 
-const subscribeToChat = (chatId) => {
+const subscribeToChat = (conversationId) => {
   if (!stompClient.value || !stompClient.value.connected) {
     console.warn("STOMP not connected yet; connect first");
     return;
   }
-  // unsubscribe previous subscription for this chat if exists
-  if (subscriptions[chatId]) {
-    subscriptions[chatId].unsubscribe();
-    delete subscriptions[chatId];
+  // unsubscribe previous subscription for this conversation if exists
+  if (subscriptions[conversationId]) {
+    try {
+      subscriptions[conversationId].unsubscribe();
+    } catch (err) {
+      // ignore
+    }
+    delete subscriptions[conversationId];
   }
 
-  // Topic configured server side should be /topic/chat.{chatId}
-  const topic = `/topic/conversation.${chatId}`;
+  // Server broadcasts to /topic/conversation.{conversationId}
+  const topic = `/topic/conversation.${conversationId}`;
   const sub = stompClient.value.subscribe(topic, (message) => {
     if (!message.body) return;
-    const msg = JSON.parse(message.body);
+    let msgObj;
+    try {
+      const parsed = JSON.parse(message.body);
+      msgObj = normalizeIncomingMessage(parsed);
+    } catch (e) {
+      // fallback simple parse
+      msgObj = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        from: "unknown",
+        text: message.body,
+        sentAt: new Date().toISOString(),
+      };
+    }
+
     // push incoming message if for current chat
-    if (selectedChat.value && selectedChat.value.id === chatId) {
-      messages.value.push(msg);
+    if (selectedChat.value && selectedChat.value.id === conversationId) {
+      messages.value.push({
+        id: msgObj.id,
+        from: msgObj.from,
+        text: msgObj.text,
+        sentAt: msgObj.sentAt,
+        raw: msgObj.raw,
+      });
       scrollToBottom();
     }
+
     // optionally update chat preview in chat list
-    const c = chats.value.find((x) => x.id === chatId);
-    if (c) c.lastMessage = msg.text;
+    const c = chats.value.find((x) => x.id === conversationId);
+    if (c) c.lastMessage = msgObj.text;
   });
 
-  subscriptions[chatId] = sub;
+  subscriptions[conversationId] = sub;
 };
 
-const unsubscribeFromChat = (chatId) => {
-  if (subscriptions[chatId]) {
-    subscriptions[chatId].unsubscribe();
-    delete subscriptions[chatId];
+const unsubscribeFromChat = (conversationId) => {
+  if (subscriptions[conversationId]) {
+    try {
+      subscriptions[conversationId].unsubscribe();
+    } catch (err) {
+      // ignore
+    }
+    delete subscriptions[conversationId];
   }
 };
 
@@ -210,39 +324,53 @@ const selectChat = async (chat) => {
   // ensure websocket connected
   if (!stompClient.value || !stompClient.value.connected) {
     connectWebsocket();
-    // subscription will be made in onConnect
-    // but if already connected, subscribe now:
-    if (stompClient.value && stompClient.value.connected) {
-      subscribeToChat(chat.id);
-    }
+    // subscription will be made in onConnect; if already connected, subscribe now:
+    // small delay to wait for onConnect to trigger registration & then subscribe
+    const waitForConnect = () =>
+      new Promise((resolve) => {
+        const check = () => {
+          if (stompClient.value && stompClient.value.connected) return resolve();
+          setTimeout(check, 100);
+        };
+        check();
+      });
+    waitForConnect().then(() => subscribeToChat(chat.id));
   } else {
     subscribeToChat(chat.id);
   }
 };
 
-/* Send message: publish to STOMP destination; also POST to REST (optional) */
+/* Send message: publish to STOMP destination; also fallback to REST POST */
 const onSend = async () => {
   const txt = newMessage.value && newMessage.value.trim();
   if (!txt || !selectedChat.value) return;
 
-  // message payload
+  // message payload expected by backend ChatController.sendMessage(SendMessageRequest)
   const payload = {
-    chatId: selectedChat.value.id,
+    conversationId: selectedChat.value.id,
+    senderId: currentUser, // must match server expectations (your auth user id)
+    content: txt,
+  };
+
+  // optimistic UI entry (use temporary id)
+  const optimistic = {
+    id: `temp-${Date.now()}`,
     from: currentUser,
     text: txt,
     sentAt: new Date().toISOString(),
+    optimistic: true,
   };
 
-  // send via STOMP to /app/chat/{chatId}
   try {
     if (stompClient.value && stompClient.value.connected) {
-      const dest = `/app/chat.${selectedChat.value.id}`;
+      // server expects destination /app/chat.send
       stompClient.value.publish({
-        destination: dest,
+        destination: "/app/chat.send",
         body: JSON.stringify(payload),
       });
-      // optimistically add to UI
-      messages.value.push({ ...payload });
+
+      // add optimistic message to UI
+      messages.value.push(optimistic);
       newMessage.value = "";
       await scrollToBottom();
       return;
@@ -253,8 +381,12 @@ const onSend = async () => {
 
   // fallback: POST to REST endpoint (server should broadcast too)
   try {
-    await axios.post(`${API_BASE}/chats/${selectedChat.value.id}/messages`, payload);
+    await axios.post(
+      `${API_BASE}/messages/conversations/${selectedChat.value.id}/messages` /* optional route on server */,
+      payload
+    );
     newMessage.value = "";
+    // server should broadcast; optionally you can append optimistic message until server confirms
   } catch (err) {
     console.error("Failed to send message via REST", err);
   }
@@ -273,7 +405,7 @@ onBeforeUnmount(() => {
 });
 
 watch(selectedChat, () => {
-  // any extra logic when selected chat changes
+  // placeholder for extra logic on conversation change
 });
 </script>
 
