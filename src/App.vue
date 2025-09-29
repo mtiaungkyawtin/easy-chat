@@ -33,7 +33,7 @@
         <div
           v-for="(msg, idx) in messages"
           :key="msg.id ?? idx"
-          :class="['message', msg.from === currentUser ? 'me' : 'other']"
+          :class="['message', msg.from === currentUser.id ? 'me' : 'other']"
         >
           <div class="meta">
             <strong>{{ msg.from }}</strong>
@@ -80,14 +80,17 @@
  */
 
 import { ref, reactive, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
-import axios from "axios";
+import api from "@/api.js";
 import * as StompJs from "@stomp/stompjs";
-import SockJS from "sockjs-client";
+import SockJS from "sockjs-client/dist/sockjs.js";
 
 /* --------- Config (change to your backend URLs) ---------- */
 const API_BASE = "http://localhost:8485/api"; // <-- change to your API base
 const WS_URL = "http://localhost:8485/ws"; // <-- full SockJS endpoint (must match Spring mapping)
-const currentUser = localStorage.getItem("username") || "me"; // replace with auth-derived id/username
+const currentUser = ref({
+  id: "1",
+  name: "Admin",
+});
 /* -------------------------------------------------------- */
 
 /* state */
@@ -121,12 +124,12 @@ const formatTime = (iso) => {
 const loadChats = async () => {
   try {
     // GET /api/messages/conversations
-    const res = await axios.get(`${API_BASE}/messages/conversations`);
+    const res = await api.get(`${API_BASE}/messages/conversations`);
     // normalize to {id, name, lastMessage}
     chats.value = (res.data || []).map((c) => ({
-      id: c.id,
-      name: c.name || c.title || `Conversation ${c.id}`,
-      lastMessage: c.lastMessage || (c.last_message ? c.last_message : ""),
+      id: c.conversationId,
+      name: c.title || `Conversation ${c.conversationId}`,
+      lastMessage: c.lastMessage || "",
       raw: c,
     }));
     if (!selectedChat.value && chats.value.length) {
@@ -140,7 +143,7 @@ const loadChats = async () => {
 const loadMessages = async (conversationId) => {
   try {
     // GET /api/messages/conversations/{conversationId}
-    const res = await axios.get(`${API_BASE}/messages/conversations/${conversationId}`);
+    const res = await api.get(`${API_BASE}/messages/conversations/${conversationId}`);
     // normalize incoming message objects to UI shape: { id, from, text, sentAt }
     messages.value = (res.data || []).map((m) => normalizeIncomingMessage(m));
     await scrollToBottom();
@@ -180,7 +183,7 @@ const connectWebsocket = () => {
       try {
         client.publish({
           destination: "/app/chat.register",
-          body: JSON.stringify({ senderId: currentUser }),
+          body: JSON.stringify({ senderId: currentUser.value.id }),
         });
       } catch (err) {
         console.warn("Failed to publish register", err);
@@ -348,14 +351,17 @@ const onSend = async () => {
   // message payload expected by backend ChatController.sendMessage(SendMessageRequest)
   const payload = {
     conversationId: selectedChat.value.id,
-    senderId: currentUser, // must match server expectations (your auth user id)
+    senderId: currentUser.value.id, // must match server expectations (your auth user id)
     content: txt,
+    mediaUrl: "",
+    mediaMime: "",
+    mediaSize: 0.0
   };
 
   // optimistic UI entry (use temporary id)
   const optimistic = {
     id: `temp-${Date.now()}`,
-    from: currentUser,
+    from: currentUser.value.id,
     text: txt,
     sentAt: new Date().toISOString(),
     optimistic: true,
@@ -370,25 +376,13 @@ const onSend = async () => {
       });
 
       // add optimistic message to UI
-      messages.value.push(optimistic);
+    //  messages.value.push(optimistic);
       newMessage.value = "";
       await scrollToBottom();
       return;
     }
   } catch (err) {
     console.warn("STOMP send failed, will fallback to REST POST", err);
-  }
-
-  // fallback: POST to REST endpoint (server should broadcast too)
-  try {
-    await axios.post(
-      `${API_BASE}/messages/conversations/${selectedChat.value.id}/messages` /* optional route on server */,
-      payload
-    );
-    newMessage.value = "";
-    // server should broadcast; optionally you can append optimistic message until server confirms
-  } catch (err) {
-    console.error("Failed to send message via REST", err);
   }
 };
 
